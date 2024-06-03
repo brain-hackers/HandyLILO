@@ -30,139 +30,40 @@
  * THE SOFTWARE.
  *
  */
+#include <pm.h>
 #include <stdint.h>
 #include <windows.h>
-
-#define FSNOTIFY_POWER_OFF 1
-#define FSNOTIFY_POWER_ON 0
 
 #define BRAINLILODRV_API __declspec(dllexport)
 
 #include "BrainLILODrv.h"
 
-#define FILE_DEVICE_POWER FILE_DEVICE_ACPI
-
-#define IOCTL_POWER_CAPABILITIES CTL_CODE(FILE_DEVICE_POWER, 0x400, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_POWER_GET CTL_CODE(FILE_DEVICE_POWER, 0x401, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_POWER_SET CTL_CODE(FILE_DEVICE_POWER, 0x402, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_POWER_QUERY CTL_CODE(FILE_DEVICE_POWER, 0x403, METHOD_BUFFERED, FILE_ANY_ACCESS)
-
-typedef BOOL (*KernelIoControlProc)(DWORD dwIoControlCode, LPVOID lpInBuf, DWORD nInBufSize, LPVOID lpOutBuf,
-                                    DWORD nOutBufSize, LPDWORD lpBytesReturned);
-static KernelIoControlProc KernelIoControl;
-
-typedef LARGE_INTEGER PHYSICAL_ADDRESS, *PPHYSICAL_ADDRESS;
-
-typedef PVOID (*MmMapIoSpaceProc)(PHYSICAL_ADDRESS, ULONG, BOOL);
-static MmMapIoSpaceProc MmMapIoSpace;
-
-typedef void (*FileSystemPowerFunctionProc)(DWORD);
-static FileSystemPowerFunctionProc FileSystemPowerFunction;
-
-typedef LPVOID (*AllocPhysMemProc)(DWORD, DWORD, DWORD, DWORD, PULONG);
-
-DWORD FileSize;
-
-static void disableInterrupts()
+static void boothelper()
 {
-    asm volatile("mrs	r0, cpsr\n"
-                 "orr	r0,r0,#0x80\n"
-                 "msr	cpsr_c,r0\n"
-                 "mov	r0,#1" ::
-                     : "r0");
-}
-
-static void EDNA2_physicalInvoker()
-{
-    // r0-r7=params
-    // r8=proc address
-    asm volatile("nop\n" // who cares interrupt vectors?
-                 "nop\n"
-                 "nop\n"
-                 "nop\n"
-                 "nop\n"
-                 "nop\n"
-                 "nop\n"
-                 "nop\n"
-                 "nop\n"
-                 "nop\n"
-                 "msr	cpsr_c, #211\n" // to supervisor mode
-                 "mov	r9, #0\n"
-                 "mcr	p15,0,r9,c13,c0,0\n" // clear fcse PID
-                 "mrc	p15,0,r9,c1,c0,0\n"  // read ctrl regs
-                 "bic	r9, r9, #5\n"        // disable MMU/DCache
-                 "bic	r9, r9, #4096\n"     // disable ICache
-                 "orr	r9, r9, #8192\n"     // and reset vectors to upper
-                 "mcr	p15,0,r9,c1,c0,0\n"  // write ctrl regs
-                 "mov	r9, #0\n"
-                 "mcr	p15,0,r9,c7,c7,0\n" // invalidate cache
-                 "mcr	p15,0,r9,c8,c7,0\n" // invalidate tlb
-                 "mov	pc, r8\n"
-                 "nop\n"
-                 "nop\n");
+    asm volatile("mrc	p15,0,r10,c1,c0,0\n" // read ctrl regs
+                 "bic	r10, r10, #5\n"      // disable MMU/DCache
+                 "mcr	p15,0,r10,c1,c0,0\n" // write ctrl regs
+                 "mov   r1, #0x80000000\n"
+                 "orr   r1,r1,#0x800000\n"
+                 "bx    r1\n");
 }
 
 static void EDNA2_installPhysicalInvoker()
 {
-    void *ptr = (void *)0xa8000000;
+    void *ptr = (void *)0xA10B6000;
     wchar_t buf[256];
-    swprintf(buf, L"BrainLILO: copying PhysicalInvoker to 0x%08x from 0x%08x\n", (int)(ptr),
-             (int)(&EDNA2_physicalInvoker));
+    swprintf(buf, L"BrainLILO: copying boot helper to 0x%08x from 0x%08x\n", (int)(ptr), (int)(&boothelper));
     OutputDebugString(buf);
-    memcpy(ptr, (const void *)&EDNA2_physicalInvoker, 64 * 4);
-    // clearCache();
-}
-
-__attribute__((noreturn)) static void EDNA2_runPhysicalInvoker()
-{
-    // r0=info
-    asm volatile("msr	cpsr_c, #211\n"     // to supervisor mode
-                 "mrc	p15,0,r0,c1,c0,0\n" // read ctrl regs
-                 "bic	r0, r0, #8192\n"    // reset vector to lower
-                 "mcr	p15,0,r0,c1,c0,0\n" // write ctrl regs
-    );
-
-    for (DWORD i = 0; i < FileSize; i++)
-        *((char *)(0xa0200000 + i)) = *((char *)(0xa0000000 + i));
-
-    asm volatile("ldr	r0, =0x0000\n"
-                 "ldr	r1, =0x0000\n"
-                 "ldr	r2, =0x0000\n"
-                 "ldr	r3, =0x0000\n"
-                 "ldr	r4, =0x0000\n"
-                 "ldr	r5, =0x0000\n"
-                 "ldr	r6, =0x0000\n"
-                 "ldr	r7, =0x0000\n"
-                 "ldr	r8, =0x40200000\n"
-                 "ldr	r9, =0x0000\n"
-
-                 "mrc	p15,0,r10,c1,c0,0\n" // read ctrl regs
-                 "bic	r10, r10, #5\n"      // disable MMU/DCache
-                 "mcr	p15,0,r10,c1,c0,0\n" // write ctrl regs
-                 "swi	#0\n"                // jump!
-    );
-
-    // never reach here
-    while (true)
-        ;
-}
-
-__attribute__((noreturn)) static DWORD EDNA2_callKernelEntryPoint()
-{
-    OutputDebugString(L"BrainLILO: disabling interrupts");
-    disableInterrupts();
-    OutputDebugString(L"BrainLILO: injecting code to internal ram");
-    EDNA2_installPhysicalInvoker();
-    OutputDebugString(L"BrainLILO: invoking");
-    EDNA2_runPhysicalInvoker();
+    memcpy(ptr, (const void *)&boothelper, 64);
 }
 
 static bool doLinux()
 {
+
     TCHAR bootloaderFileName[128] = TEXT("\\Storage Card\\loader\\u-boot.bin");
     HANDLE hFile;
     wchar_t buf[256];
-    DWORD wReadSize;
+    DWORD wReadSize, FileSize;
 
     OutputDebugString(L"BrainLILO: Opening Bootloader file...");
     hFile = CreateFile(bootloaderFileName, GENERIC_READ, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -178,8 +79,9 @@ static bool doLinux()
     swprintf(buf, L"BrainLILO: Bootloader file size %d Byte\n", FileSize);
     OutputDebugString(buf);
 
-    OutputDebugString(L"BrainLILO: Preloading bootloader to 0xa0000000...");
-    if (!ReadFile(hFile, (void *)0xa0000000, FileSize, &wReadSize, NULL))
+    swprintf(buf, L"BrainLILO: Loading bootloader to 0x%08x...\n", 0xa0800000);
+    OutputDebugString(buf);
+    if (!ReadFile(hFile, (void *)0xa0800000, FileSize, &wReadSize, NULL))
     {
         OutputDebugString(L"Cant read bootloader");
         return false;
@@ -187,12 +89,11 @@ static bool doLinux()
     OutputDebugString(L"BrainLILO: Bootloader copied! Closing file handle...");
     CloseHandle(hFile);
 
-    OutputDebugString(L"BrainLILO: Notifying power off to filesystems...");
-    if (FileSystemPowerFunction)
-        FileSystemPowerFunction(FSNOTIFY_POWER_OFF);
+    OutputDebugString(L"BrainLILO: Kernel Entry Point override with branch instruction to U-Boot...");
+    EDNA2_installPhysicalInvoker();
 
-    OutputDebugString(L"BrainLILO: Starting bootloader call sequence...");
-    EDNA2_callKernelEntryPoint();
+    OutputDebugString(L"BrainLILO: Warm reset initiate...");
+    SetSystemPowerState(NULL, POWER_STATE_RESET, 0);
     return true;
 }
 
@@ -204,13 +105,7 @@ extern "C" BRAINLILODRV_API BOOL LIN_IOControl(DWORD handle, DWORD dwIoControlCo
     switch (dwIoControlCode)
     {
     case IOCTL_LIN_DO_LINUX:
-        if (!doLinux())
-        {
-            if (FileSystemPowerFunction)
-                FileSystemPowerFunction(FSNOTIFY_POWER_ON);
-            return FALSE;
-        }
-
+        doLinux();
         return TRUE;
     }
     return FALSE;
@@ -279,13 +174,6 @@ extern "C" BOOL APIENTRY DllMainCRTStartup(HANDLE hModule, DWORD ul_reason_for_c
     {
     case DLL_PROCESS_ATTACH:
     case DLL_THREAD_ATTACH:
-        KernelIoControl = (KernelIoControlProc)GetProcAddress(LoadLibrary(L"COREDLL"), L"KernelIoControl");
-
-        MmMapIoSpace = (MmMapIoSpaceProc)GetProcAddress(LoadLibrary(L"CEDDK"), L"MmMapIoSpace");
-
-        FileSystemPowerFunction =
-            (FileSystemPowerFunctionProc)GetProcAddress(LoadLibrary(L"COREDLL"), L"FileSystemPowerFunction");
-
     case DLL_THREAD_DETACH:
     case DLL_PROCESS_DETACH:
         break;
